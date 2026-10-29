@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -12,14 +14,31 @@ from supabase import create_client, Client
 # ==========================================
 # 1. ማዋቀሪያ (Configuration)
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# Keep the fallback for your token, but prefer environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN", os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE"))
 ADMIN_IDS = [7480368503]
 ADMIN_USERNAME = "@Sealilenemariyammsle12we19"
 ADMIN_EMAIL = "matewosgetahunseifu@gmail.com"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    logger = logging.getLogger(__name__)
+    logger.error("⚠️ SUPABASE_URL or SUPABASE_KEY is missing from Environment Variables!")
+    supabase = None
+
+# --- RENDER DUMMY SERVER ---
+# Render requires a web server to be running on a port, otherwise it kills the bot.
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), BaseHTTPRequestHandler)
+    server.serve_forever()
+
+# Start the dummy server in a background thread
+threading.Thread(target=run_dummy_server, daemon=True).start()
 
 # ሎግ ማዋቀሪያ
 logging.basicConfig(
@@ -40,13 +59,6 @@ ALL_CATEGORIES = [
 ]
 
 # የአስተዳዳሪ ማከማቻ
-# add_book_sessions[user_id] = {
-#   'step': 'titles' | 'files',
-#   'category': 'amh_law',
-#   'titles': ['ርዕስ 1', 'ርዕስ 2', ...],
-#   'files_received': ['file_id1', 'file_id2', ...],
-#   'current_index': 0
-# }
 add_book_sessions = {}
 
 # ==========================================
@@ -57,6 +69,7 @@ def is_admin(user_id):
 
 async def get_books(category):
     """ሁሉንም መጽሐፍች በአንድ ካታጎሪ አመጣ"""
+    if not supabase: return []
     try:
         result = supabase.table('books').select('*').eq('category', category).order('order', desc=False).execute()
         return result.data or []
@@ -66,6 +79,7 @@ async def get_books(category):
 
 async def get_book(book_id):
     """አንድ መጽሐፍ በID አመጣ"""
+    if not supabase: return None
     try:
         result = supabase.table('books').select('*').eq('id', book_id).single().execute()
         return result.data
@@ -74,8 +88,8 @@ async def get_book(book_id):
 
 async def add_book_to_db(book):
     """አዲስ መጽሐፍ ወደ DB ጨምር"""
+    if not supabase: return None
     try:
-        # ቀጣዩን order አስላ
         existing = supabase.table('books').select('order').eq('category', book['category']).order('order', desc=True).limit(1).execute()
         next_order = (existing.data[0]['order'] + 1) if existing.data else 1
         book['order'] = next_order
@@ -86,6 +100,7 @@ async def add_book_to_db(book):
         return None
 
 async def remove_book_from_db(book_id):
+    if not supabase: return None
     try:
         result = supabase.table('books').delete().eq('id', book_id).execute()
         return result.data
@@ -94,6 +109,7 @@ async def remove_book_from_db(book_id):
         return None
 
 async def reorder_books_in_db(category, ordered_ids):
+    if not supabase: return False
     try:
         for i, book_id in enumerate(ordered_ids):
             supabase.table('books').update({'order': i + 1}).eq('id', book_id).execute()
@@ -104,11 +120,12 @@ async def reorder_books_in_db(category, ordered_ids):
 
 async def register_user(from_user):
     """ተጠቃሚ መዝግብ (ነጻ - ሁሉም ተጠቃሚዎች እኩል ናቸው)"""
+    if not supabase: return
     try:
         supabase.table('users').upsert({
             'id': from_user.id,
             'username': f"@{from_user.username}" if from_user.username else "No Username",
-            'is_paid': True,  # ሁሉም ነጻ!
+            'is_paid': True,
             'registration_date': datetime.utcnow().isoformat(),
             'preferred_language': None,
             'total_downloads': 0,
@@ -119,8 +136,8 @@ async def register_user(from_user):
 
 async def track_download(user_id, cat_key, book_id):
     """የማውረድ ቆጠራ መዝግብ"""
+    if not supabase: return
     try:
-        # የተጠቃሚ ስታት አዘምን
         user_res = supabase.table('users').select('*').eq('id', user_id).single().execute()
         if user_res.data:
             user = user_res.data
@@ -134,7 +151,6 @@ async def track_download(user_id, cat_key, book_id):
                 'books_downloaded': books
             }).eq('id', user_id).execute()
 
-        # የመጽሐፍ ስታት አዘምን
         book_key = f"{cat_key}_{book_id}"
         stat_res = supabase.table('book_stats').select('*').eq('book_key', book_key).execute()
         if stat_res.data:
@@ -212,6 +228,9 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu_stats":
+        if not supabase:
+            await query.edit_message_text("❌ የውሂብ ቤት ግንኙነት አልተሳካም።")
+            return
         try:
             res = supabase.table('users').select('*').eq('id', update.effective_user.id).single().execute()
             user = res.data
@@ -379,7 +398,6 @@ async def book_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # ሙሉ መጽሐፍ ላክ (ምንም ክፍያ የለም!)
         await context.bot.send_document(
             chat_id=query.message.chat_id,
             document=book['file_id'],
@@ -437,7 +455,6 @@ async def add_book_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_book_sessions[user_id] = {'step': 'category', 'category': None, 'titles': [], 'files': []}
 
-    # ሁሉንም ካታጎሪዎች በቁልፍ አሳይ
     kb = []
     row = []
     for i, cat in enumerate(ALL_CATEGORIES):
@@ -511,7 +528,6 @@ async def add_titles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # ርዕስ ጨምር
     add_book_sessions[user_id]['titles'].append(text)
     count = len(add_book_sessions[user_id]['titles'])
     await update.message.reply_text(
@@ -550,9 +566,7 @@ async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📎 ፋይል #{received}/{total} ተቀብለናል።")
 
-    # ሁሉም ፋይሎች ተሟልተዋል?
     if received == total:
-        # በራስ-ሰር አስቀምጥ
         await update.message.reply_text("⏳ እያስቀመጥን ነው...")
         added = 0
         for i, title in enumerate(session['titles']):
@@ -688,6 +702,7 @@ async def random_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    if not supabase: return
     try:
         res = supabase.table('users').select('*').execute()
         total = len(res.data or [])
@@ -698,8 +713,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    if not supabase: return
     await update.message.reply_text("💾 ምትኬ በመስራት ላይ...")
-    # በቀላሉ ሁሉንም መረጃ ከ Supabase አውጣ
     try:
         users = supabase.table('users').select('*').execute().data or []
         books = supabase.table('books').select('*').execute().data or []
@@ -718,7 +733,30 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # 14. ዋና ማስጀመሪያ (Main)
 # ==========================================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in add_book_sessions:
+        step = add_book_sessions[user_id]['step']
+        if step == 'titles':
+            await add_titles_handler(update, context)
+            return
+        if step == 'remove':
+            await remove_text(update, context)
+            return
+        if step == 'order':
+            await order_text(update, context)
+            return
+        if step == 'files':
+            await update.message.reply_text("📤 እባክዎትን ፋይሎችን ይላኩ (ጽሑፍ አይቀበልም)።")
+            return
+    # ፍለጋ
+    await text_search(update, context)
+
 def main():
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.error("⚠️ BOT_TOKEN is missing! Please set it in Render Environment Variables.")
+        return
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Commands
@@ -749,25 +787,6 @@ def main():
 
     logger.info("🤖 Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in add_book_sessions:
-        step = add_book_sessions[user_id]['step']
-        if step == 'titles':
-            await add_titles_handler(update, context)
-            return
-        if step == 'remove':
-            await remove_text(update, context)
-            return
-        if step == 'order':
-            await order_text(update, context)
-            return
-        if step == 'files':
-            await update.message.reply_text("📤 እባክዎትን ፋይሎችን ይላኩ (ጽሑፍ አይቀበልም)።")
-            return
-    # ፍለጋ
-    await text_search(update, context)
 
 if __name__ == '__main__':
     main()
